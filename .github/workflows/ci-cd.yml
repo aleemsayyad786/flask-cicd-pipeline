@@ -1,0 +1,200 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/flask-cicd-demo
+  PYTHON_VERSION: "3.12"
+
+# Cancel in-progress runs on the same branch (saves CI minutes)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ────────────────────────────────────────────────
+  # JOB 1 — Code Quality & Linting
+  # ────────────────────────────────────────────────
+  lint:
+    name: "Lint & Code Quality"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install linting tools
+        run: pip install flake8 flake8-bugbear
+
+      - name: Run Flake8
+        run: |
+          flake8 app/ tests/ \
+            --max-line-length=100 \
+            --extend-ignore=E203,W503 \
+            --statistics
+
+  # ────────────────────────────────────────────────
+  # JOB 2 — Test Suite with Coverage
+  # ────────────────────────────────────────────────
+  test:
+    name: "Tests (Python ${{ matrix.python-version }})"
+    runs-on: ubuntu-latest
+    needs: lint
+
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]   # test multiple versions
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ -v \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=80
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: matrix.python-version == env.PYTHON_VERSION
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  # ────────────────────────────────────────────────
+  # JOB 3 — Docker Build & Security Scan
+  # ────────────────────────────────────────────────
+  docker-build:
+    name: "Docker Build & Security Scan"
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (no push yet)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.DOCKER_IMAGE }}:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+          outputs: type=docker,dest=/tmp/image.tar
+
+      - name: Load image for scanning
+        run: docker load --input /tmp/image.tar
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.DOCKER_IMAGE }}:scan"
+          format: "table"
+          exit-code: "1"           # fail pipeline on CRITICAL CVEs
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+
+  # ────────────────────────────────────────────────
+  # JOB 4 — Push to Docker Hub  (main branch only)
+  # ────────────────────────────────────────────────
+  docker-push:
+    name: "Push to Docker Hub"
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate Docker metadata (tags & labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+          platforms: linux/amd64,linux/arm64    # multi-arch
+
+      - name: Post summary
+        run: |
+          echo "## Docker Image Published 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.DOCKER_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA   | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run   | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> $GITHUB_STEP_SUMMARY
+
+  # ────────────────────────────────────────────────
+  # JOB 5 — Notify on Failure
+  # ────────────────────────────────────────────────
+  notify-failure:
+    name: "Notify on Failure"
+    runs-on: ubuntu-latest
+    needs: [ lint, test, docker-build, docker-push ]
+    if: failure()
+
+    steps:
+      - name: Post failure summary
+        run: |
+          echo "## Pipeline Failed ❌" >> $GITHUB_STEP_SUMMARY
+          echo "One or more jobs failed. Check the logs above." >> $GITHUB_STEP_SUMMARY
